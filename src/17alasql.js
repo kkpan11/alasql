@@ -126,8 +126,14 @@ alasql.options = {
 
 	loopbreak: 100000,
 
+	/** Maximum iterations for recursive CTEs to prevent infinite loops */
+	maxCteIterations: 1000,
+
 	/** Whether GETDATE() and NOW() return dates as string. If false, then a Date object is returned */
 	dateAsString: true,
+
+	/** Automatically convert string values to numbers when reading from CSV files. Set to false to preserve string types */
+	csvStringToNumber: true,
 };
 
 //alasql.options.worker = false;
@@ -269,7 +275,9 @@ alasql.dexec = function (databaseid, sql, params, cb, scope) {
 	//	if(db.databaseid != databaseid) console.trace('got!');
 	//	console.log(3,db.databaseid,databaseid);
 
-	var hh = hash(sql);
+	// Include joinstar option in cache key because it affects how SELECT * compiles
+	// Without this, changing joinstar would use stale cached queries compiled with old option
+	var hh = hash(sql + '|joinstar:' + alasql.options.joinstar);
 
 	// Create hash
 	if (alasql.options.cache) {

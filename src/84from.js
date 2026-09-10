@@ -41,7 +41,7 @@ alasql.from.HTML = function (selector, opts, cb, idx, query) {
 	alasql.utils.extend(opt, opts);
 
 	var sel = document.querySelector(selector);
-	if (!sel && sel.tagName !== 'TABLE') {
+	if (!sel || sel.tagName !== 'TABLE') {
 		throw new Error('Selected HTML element is not a TABLE');
 	}
 
@@ -97,6 +97,35 @@ alasql.from.RANGE = function (start, finish, cb, idx, query) {
 	return res;
 };
 
+/**
+ * UNNEST function - converts an array into a table for use in FROM clauses
+ *
+ * This function enables flattening of nested arrays when used with CROSS APPLY or OUTER APPLY.
+ *
+ * @param {Array} arr - The array to unnest
+ * @param {Object} opts - Options (reserved for future use)
+ * @param {Function} cb - Callback function
+ * @param {number} idx - Index
+ * @param {Object} query - Query object
+ * @returns {Array} The input array, or empty array if input is not an array
+ *
+ * @example
+ * // Flatten nested arrays
+ * SELECT b.name, e.id, e.value
+ * FROM data AS b
+ * CROSS APPLY (SELECT * FROM UNNEST(b.entries)) AS e
+ */
+alasql.from.UNNEST = function (arr, opts, cb, idx, query) {
+	var res = arr;
+	if (!Array.isArray(res)) {
+		res = [];
+	}
+	if (cb) {
+		res = cb(res, idx, query);
+	}
+	return res;
+};
+
 // Read data from any file
 alasql.from.FILE = function (filename, opts, cb, idx, query) {
 	var fname;
@@ -124,7 +153,7 @@ alasql.from.JSON = function (filename, opts, cb, idx, query) {
 	//console.log('cb',cb);
 	//console.log('JSON');
 	filename = alasql.utils.autoExtFilename(filename, 'json', opts);
-	alasql.utils.loadFile(filename, !!cb, function (data) {
+	(alasql.utils.loadFile(filename, !!cb, function (data) {
 		//		console.log('DATA:'+data);
 		//		res = [{a:1}];
 		res = JSON.parse(data);
@@ -134,12 +163,12 @@ alasql.from.JSON = function (filename, opts, cb, idx, query) {
 	}),
 		err => {
 			const error = err instanceof Error ? err : new Error(err);
-			if(query && query.cb) {
+			if (query && query.cb) {
 				query.cb(null, error);
 				return;
 			}
 			throw error;
-		};
+		});
 	return res;
 };
 
@@ -168,7 +197,7 @@ const jsonl = ext => {
 			},
 			err => {
 				const error = err instanceof Error ? err : new Error(err);
-				if(query && query.cb) {
+				if (query && query.cb) {
 					query.cb(null, error);
 					return;
 				}
@@ -227,6 +256,16 @@ alasql.from.CSV = function (contents, opts, cb, idx, query) {
 	alasql.utils.extend(opt, opts);
 	var res;
 	var hs = [];
+	// Determine once whether to auto-convert: not raw mode, not SELECT INTO, and csvStringToNumber option is set
+	const shouldAutoConvert = !opt.raw && !query?.intofns && alasql.options.csvStringToNumber;
+
+	function potentialAutoConvert(val) {
+		if (shouldAutoConvert && val !== undefined && val.length !== 0 && val == +val) {
+			return +val;
+		}
+		return val;
+	}
+
 	function parseText(text) {
 		var delimiterCode = opt.separator.charCodeAt(0);
 		var quoteCode = opt.quote.charCodeAt(0);
@@ -244,7 +283,7 @@ alasql.from.CSV = function (contents, opts, cb, idx, query) {
 				return EOF;
 			}
 			if (eol) {
-				return (eol = false), EOL;
+				return ((eol = false), EOL);
 			}
 			var j = I;
 			if (text.charCodeAt(j) === quoteCode) {
@@ -303,51 +342,22 @@ alasql.from.CSV = function (contents, opts, cb, idx, query) {
 						hs = opt.headers;
 						var r = {};
 						hs.forEach(function (h, idx) {
-							r[h] = a[idx];
-							// Please avoid === here
-							if (
-								!opt.raw &&
-								typeof r[h] !== 'undefined' &&
-								r[h].length !== 0 &&
-								r[h].trim() == +r[h]
-							) {
-								// jshint ignore:line
-								r[h] = +r[h];
-							}
+							r[h] = potentialAutoConvert(a[idx]);
 						});
 						rows.push(r);
 					}
 				} else {
 					var r = {};
 					hs.forEach(function (h, idx) {
-						r[h] = a[idx];
-						if (
-							!opt.raw &&
-							typeof r[h] !== 'undefined' &&
-							r[h].length !== 0 &&
-							r[h].trim() == +r[h]
-						) {
-							// jshint ignore:line
-							r[h] = +r[h];
-						}
+						r[h] = potentialAutoConvert(a[idx]);
 					});
 					rows.push(r);
 				}
 				n++;
 			} else {
 				var r = {};
-				// different bug here, if headers are not defined, the numerical values will not be parsed
 				a.forEach(function (v, idx) {
-					r[idx] = a[idx];
-					if (
-						!opt.raw &&
-						typeof r[idx] !== 'undefined' &&
-						r[idx].length !== 0 &&
-						r[idx].trim() == +r[idx]
-					) {
-						// jshint ignore:line
-						r[idx] = +r[idx];
-					}
+					r[idx] = potentialAutoConvert(a[idx]);
 				});
 				rows.push(r);
 			}
@@ -440,6 +450,71 @@ function XLSXLSX(X, filename, opts, cb, idx, query) {
 			return text;
 		}
 	}
+
+	function processSheet(workbook, sheetid, sheetOpt) {
+		var range;
+		var sheetRes = [];
+		if (typeof sheetOpt.range === 'undefined') {
+			range = workbook.Sheets[sheetid]['!ref'];
+		} else {
+			range = sheetOpt.range;
+			if (workbook.Sheets[sheetid][range]) {
+				range = workbook.Sheets[sheetid][range];
+			}
+		}
+		// if range has some value then data is present in the current sheet
+		// else current sheet is empty
+		if (range) {
+			var rg = range.split(':');
+			var col0 = rg[0].match(/[A-Z]+/)[0];
+			var row0 = +rg[0].match(/[0-9]+/)[0];
+			var col1 = rg[1].match(/[A-Z]+/)[0];
+			var row1 = +rg[1].match(/[0-9]+/)[0];
+
+			var hh = {};
+			var xlscnCol0 = alasql.utils.xlscn(col0);
+			var xlscnCol1 = alasql.utils.xlscn(col1);
+			for (var j = xlscnCol0; j <= xlscnCol1; j++) {
+				var col = alasql.utils.xlsnc(j);
+				if (sheetOpt.headers) {
+					if (workbook.Sheets[sheetid][col + '' + row0]) {
+						hh[col] = getHeaderText(workbook.Sheets[sheetid][col + '' + row0].v);
+					} else {
+						hh[col] = getHeaderText(col);
+					}
+				} else {
+					hh[col] = col;
+				}
+			}
+			if (sheetOpt.headers) {
+				row0++;
+			}
+			for (var i = row0; i <= row1; i++) {
+				var row = {};
+				for (var j = xlscnCol0; j <= xlscnCol1; j++) {
+					var col = alasql.utils.xlsnc(j);
+					if (workbook.Sheets[sheetid][col + '' + i]) {
+						row[hh[col]] = workbook.Sheets[sheetid][col + '' + i].v;
+					}
+				}
+				sheetRes.push(row);
+			}
+		} else {
+			sheetRes.push([]);
+		}
+
+		// Remove last empty line (issue #548)
+		if (
+			sheetRes.length > 0 &&
+			sheetRes[sheetRes.length - 1] &&
+			Object.keys(sheetRes[sheetRes.length - 1]).length == 0
+		) {
+			sheetRes.pop();
+		}
+
+		return sheetRes;
+	}
+
 	filename = alasql.utils.autoExtFilename(filename, 'xls', opts);
 	alasql.utils.loadBinaryFile(
 		filename,
@@ -460,71 +535,44 @@ function XLSXLSX(X, filename, opts, cb, idx, query) {
 					...opts,
 				});
 			}
-			//		console.log(workbook);
-			var sheetid;
-			if (typeof opt.sheetid === 'undefined') {
-				sheetid = workbook.SheetNames[0];
-			} else if (typeof opt.sheetid === 'number') {
-				sheetid = workbook.SheetNames[opt.sheetid];
-			} else {
-				sheetid = opt.sheetid;
-			}
-			var range;
-			var res = [];
-			if (typeof opt.range === 'undefined') {
-				range = workbook.Sheets[sheetid]['!ref'];
-			} else {
-				range = opt.range;
-				if (workbook.Sheets[sheetid][range]) {
-					range = workbook.Sheets[sheetid][range];
-				}
-			}
-			// if range has some value then data is present in the current sheet
-			// else current sheet is empty
-			if (range) {
-				var rg = range.split(':');
-				var col0 = rg[0].match(/[A-Z]+/)[0];
-				var row0 = +rg[0].match(/[0-9]+/)[0];
-				var col1 = rg[1].match(/[A-Z]+/)[0];
-				var row1 = +rg[1].match(/[0-9]+/)[0];
-				//		console.log(114,rg,col0,col1,row0,row1);
-				//		console.log(114,rg,alasql.utils.xlscn(col0),alasql.utils.xlscn(col1));
 
-				var hh = {};
-				var xlscnCol0 = alasql.utils.xlscn(col0);
-				var xlscnCol1 = alasql.utils.xlscn(col1);
-				for (var j = xlscnCol0; j <= xlscnCol1; j++) {
-					var col = alasql.utils.xlsnc(j);
-					if (opt.headers) {
-						if (workbook.Sheets[sheetid][col + '' + row0]) {
-							hh[col] = getHeaderText(workbook.Sheets[sheetid][col + '' + row0].v);
-						} else {
-							hh[col] = getHeaderText(col);
+			// Check if we should process multiple sheets
+			var shouldProcessMultipleSheets =
+				opt.sheetid === '*' || (Array.isArray(opt.sheetid) && opt.sheetid.length > 0);
+
+			if (shouldProcessMultipleSheets) {
+				// Process multiple sheets and combine into a single array
+				res = [];
+				var sheetsToProcess = opt.sheetid === '*' ? workbook.SheetNames : opt.sheetid;
+
+				for (var s = 0; s < sheetsToProcess.length; s++) {
+					var currentSheetId =
+						opt.sheetid === '*'
+							? sheetsToProcess[s]
+							: typeof sheetsToProcess[s] === 'number'
+								? workbook.SheetNames[sheetsToProcess[s]]
+								: sheetsToProcess[s];
+
+					if (workbook.Sheets[currentSheetId]) {
+						var sheetData = processSheet(workbook, currentSheetId, opt);
+						// Add sheet name to each row
+						for (var r = 0; r < sheetData.length; r++) {
+							sheetData[r]._sheet = currentSheetId;
 						}
-					} else {
-						hh[col] = col;
+						res = res.concat(sheetData);
 					}
 				}
-				if (opt.headers) {
-					row0++;
-				}
-				for (var i = row0; i <= row1; i++) {
-					var row = {};
-					for (var j = xlscnCol0; j <= xlscnCol1; j++) {
-						var col = alasql.utils.xlsnc(j);
-						if (workbook.Sheets[sheetid][col + '' + i]) {
-							row[hh[col]] = workbook.Sheets[sheetid][col + '' + i].v;
-						}
-					}
-					res.push(row);
-				}
 			} else {
-				res.push([]);
-			}
-
-			// Remove last empty line (issue #548)
-			if (res.length > 0 && res[res.length - 1] && Object.keys(res[res.length - 1]).length == 0) {
-				res.pop();
+				// Process single sheet (original behavior)
+				var sheetid;
+				if (typeof opt.sheetid === 'undefined') {
+					sheetid = workbook.SheetNames[0];
+				} else if (typeof opt.sheetid === 'number') {
+					sheetid = workbook.SheetNames[opt.sheetid];
+				} else {
+					sheetid = opt.sheetid;
+				}
+				res = processSheet(workbook, sheetid, opt);
 			}
 
 			if (cb) {

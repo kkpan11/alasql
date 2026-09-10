@@ -25,9 +25,11 @@ var utils = (alasql.utils = {});
   NaN         => undefined
 
   */
-function n2u(s) {
+function nanToUndefined(s) {
+	//rename for clarity.
 	return '(y=' + s + ',y===y?y:undefined)';
 }
+var n2u = nanToUndefined; // Alias for backward compatibility
 
 /**
   Return undefined if s undefined
@@ -41,9 +43,11 @@ function n2u(s) {
   NaN,a       => undefined
 
   */
-function und(s, r) {
+function undefinedOrValue(s, r) {
+	//rename for clarity
 	return '(y=' + s + ',typeof y=="undefined"?undefined:' + r + ')';
 }
+var und = undefinedOrValue; // Alias for backward compatibility
 
 /**
   Return always true. Stub for non-ecisting WHERE clause, because is faster then if(whenrfn) whenfn()
@@ -310,7 +314,7 @@ let loadFile = (utils.loadFile = function (path, asy, success, error) {
 		fs = require('fs');
 
 		// If path is empty, than read data from stdin (for Node)
-		if (typeof path === 'undefined') {
+		if ([null, undefined].includes(path)) {
 			var buff = '';
 			process.stdin.setEncoding('utf8');
 			process.stdin.on('readable', function () {
@@ -345,7 +349,7 @@ let loadFile = (utils.loadFile = function (path, asy, success, error) {
 		try {
 			data = fs.readFileSync(path);
 		} catch (e) {
-			error(err, null);
+			error(e, null);
 			return;
 		}
 
@@ -443,6 +447,19 @@ async function fetchData(path, success, error, async) {
 
 function getData(path, success, error) {
 	return _fetch(path)
+		.then(response => response.text())
+		.then(txt => {
+			success(txt);
+		})
+		.catch(e => {
+			if (error) return error(e);
+			console.error(e);
+			throw e;
+		});
+}
+
+function getBinaryData(path, success, error) {
+	return _fetch(path)
 		.then(response => response.arrayBuffer())
 		.then(buf => {
 			var a = new Uint8Array(buf);
@@ -481,7 +498,7 @@ var loadBinaryFile = (utils.loadBinaryFile = function (
 		fs = require('fs');
 
 		if (/^[a-z]+:\/\//i.test(path)) {
-			fetchData(path, success, error, runAsync);
+			return getBinaryData(path, success, error);
 		} else {
 			if (runAsync) {
 				fs.readFile(path, function (err, data) {
@@ -1173,76 +1190,106 @@ var domEmptyChildren = (utils.domEmptyChildren = function (container) {
   @parameter {string} escape Escape character (optional)
   @return {boolean} If value LIKE pattern ESCAPE escape
   */
-var patternCache = {};
-var like = (utils.like = function (pattern, value, escape) {
-	if (!patternCache[pattern]) {
-		// Verify escape character
-		if (!escape) escape = '';
 
-		var i = 0;
-		var s = '^';
+/* * Tests if a given value matches a pattern with optional escape character.
+ * Supports SQL-like syntax with % and _ as wildcards and custom escape character.
+ */
+var patternCache = {};
+var like = (utils.like = function (pattern, value, escape = '') {
+	if (!patternCache[pattern]) {
+		var regexStr = '^'; // Start regex pattern to match from the beginning.
+		var i = 0; // Index for traversing the pattern string.
 
 		while (i < pattern.length) {
-			var c = pattern[i],
-				c1 = '';
-			if (i < pattern.length - 1) c1 = pattern[i + 1];
+			var currentChar = pattern[i];
+			var nextChar = i < pattern.length - 1 ? pattern[i + 1] : '';
 
-			if (c === escape) {
-				s += '\\' + c1;
-				i++;
-			} else if (c === '[' && c1 === '^') {
-				s += '[^';
-				i++;
-			} else if (c === '[' || c === ']') {
-				s += c;
-			} else if (c === '%') {
-				s += '[\\s\\S]*';
-			} else if (c === '_') {
-				s += '.';
-			} else if ('/.*+?|(){}'.indexOf(c) > -1) {
-				s += '\\' + c;
-			} else {
-				s += c;
+			// Handle escape character.
+			if (currentChar === escape) {
+				regexStr += '\\' + nextChar;
+				i++; // Skip next character as it's escaped.
+			}
+			// Handle negation within character classes.
+			else if (currentChar === '[' && nextChar === '^') {
+				regexStr += '[^';
+				i++; // Include '^' as part of the set.
+			}
+			// Directly append square brackets.
+			else if (currentChar === '[' || currentChar === ']') {
+				regexStr += currentChar;
+			}
+			// Replace '%' with regex to match any character sequence.
+			else if (currentChar === '%') {
+				regexStr += '[\\s\\S]*';
+			}
+			// Replace '_' with regex to match any single character.
+			else if (currentChar === '_') {
+				regexStr += '.';
+			}
+			// Escape special regex characters.
+			else if ('/.*+?|(){}'.indexOf(currentChar) > -1) {
+				regexStr += '\\' + currentChar;
+			}
+			// Append literal characters.
+			else {
+				regexStr += currentChar;
 			}
 			i++;
 		}
 
-		s += '$';
-		//    if(value == undefined) return false;
-		//console.log(s,value,(value||'').search(RegExp(s))>-1);
-		patternCache[pattern] = RegExp(s, 'i');
+		regexStr += '$'; // End regex pattern to match until the end.
+		// Compile and cache the regex pattern for future use.
+		patternCache[pattern] = RegExp(regexStr, 'i');
 	}
+
+	// Convert value to string (handling null/undefined) and test against compiled pattern.
 	return ('' + (value ?? '')).search(patternCache[pattern]) > -1;
 });
 
+/**
+ * Tests if a given value matches a glob pattern.
+ * The function supports '*', '?' as wildcards where '*' matches any sequence of characters,
+ * and '?' matches any single character. Square brackets can be used for character sets and ranges.
+ *
+ * @param {string} value - The string value to test against the glob pattern.
+ * @param {string} pattern - The glob pattern to match the value against.
+ * @returns {boolean} - True if the value matches the pattern, false otherwise.
+ */
 utils.glob = function (value, pattern) {
-	var i = 0;
-	var s = '^';
+	var currentIndex = 0; // Index for traversing the pattern string.
+	var regexPattern = '^'; // Start regex pattern to match from the beginning.
 
-	while (i < pattern.length) {
-		var c = pattern[i],
-			c1 = '';
-		if (i < pattern.length - 1) c1 = pattern[i + 1];
+	while (currentIndex < pattern.length) {
+		var currentChar = pattern[currentIndex];
+		var nextChar = currentIndex < pattern.length - 1 ? pattern[currentIndex + 1] : '';
 
-		if (c === '[' && c1 === '^') {
-			s += '[^';
-			i++;
-		} else if (c === '[' || c === ']') {
-			s += c;
-		} else if (c === '*') {
-			s += '.*';
-		} else if (c === '?') {
-			s += '.';
-		} else if ('/.*+?|(){}'.indexOf(c) > -1) {
-			s += '\\' + c;
+		// Handle character sets and negation within them.
+		if (currentChar === '[' && nextChar === '^') {
+			regexPattern += '[^';
+			currentIndex++; // Include '^' as part of the set.
+		} else if (currentChar === '[' || currentChar === ']') {
+			// Directly append square brackets.
+			regexPattern += currentChar;
+		} else if (currentChar === '*') {
+			// Replace '*' with regex to match any character sequence.
+			regexPattern += '.*';
+		} else if (currentChar === '?') {
+			// Replace '?' with regex to match any single character.
+			regexPattern += '.';
+		} else if ('/.*+?|(){}'.indexOf(currentChar) > -1) {
+			// Escape special regex characters.
+			regexPattern += '\\' + currentChar;
 		} else {
-			s += c;
+			// Append literal characters.
+			regexPattern += currentChar;
 		}
-		i++;
+		currentIndex++;
 	}
 
-	s += '$';
-	return ('' + (value || '')).toUpperCase().search(RegExp(s.toUpperCase())) > -1;
+	regexPattern += '$'; // End regex pattern to match until the end.
+
+	// Convert value to uppercase, compile the regex pattern in uppercase to perform a case-insensitive match.
+	return ('' + (value || '')).toUpperCase().search(RegExp(regexPattern.toUpperCase())) > -1;
 };
 
 /**
@@ -1298,6 +1345,65 @@ var getXLSX = function () {
 	}
 
 	return XLSX;
+};
+
+/**
+ * Type converter regex patterns
+ */
+var reTypeConverter = {
+	str: /string|char$|text/i,
+	int: /^int|int$/i,
+	num: /float|double|real|^num|decimal|money/i,
+	bool: /^bool/i,
+	date: /^date|^time/i,
+};
+
+/**
+ * Convert a value to the appropriate type based on column definition
+ * @param {*} value - The value to convert
+ * @param {string} dbtypeid - The database type (INT, FLOAT, STRING, etc.)
+ * @return {*} The converted value
+ */
+utils.typeConverter = function (value, dbtypeid) {
+	// If value is null or undefined, return as is
+	if (value === null || value === undefined) {
+		return value;
+	}
+
+	// If no type specified, try to auto-convert if it looks like a number
+	if (!dbtypeid) {
+		if (alasql.options.csvStringToNumber && typeof value === 'string' && value.length > 0) {
+			if (value == +value) {
+				return +value;
+			}
+		}
+		return value;
+	}
+
+	// Check type using regex patterns
+	if (reTypeConverter.str.test(dbtypeid)) {
+		return String(value);
+	}
+	if (reTypeConverter.int.test(dbtypeid)) {
+		var intVal = parseInt(value, 10);
+		return isNaN(intVal) ? value : intVal;
+	}
+	if (reTypeConverter.num.test(dbtypeid)) {
+		var numVal = parseFloat(value);
+		return isNaN(numVal) ? value : numVal;
+	}
+	if (reTypeConverter.bool.test(dbtypeid)) {
+		if (typeof value === 'string') {
+			return /^(true|1|yes)$/i.test(value);
+		}
+		return Boolean(value);
+	}
+	if (reTypeConverter.date.test(dbtypeid)) {
+		return value instanceof Date ? value : new Date(value);
+	}
+
+	// Unknown type, return as is
+	return value;
 };
 
 // set AlaSQl path

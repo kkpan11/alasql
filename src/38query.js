@@ -8,6 +8,9 @@ function queryfn(query, oldscope, cb, A, B) {
 	query.cb = cb;
 	query.oldscope = oldscope;
 
+	// Clear subquery cache from previous execution (used by IN/NOT IN optimization)
+	query.subqueryCache = {};
+
 	// Run all subqueries before main statement
 	if (query.queriesfn) {
 		query.sourceslen += query.queriesfn.length;
@@ -31,7 +34,7 @@ function queryfn(query, oldscope, cb, A, B) {
 		var rs = source.datafn(query, query.params, queryfn2, idx, alasql);
 		if (typeof rs !== 'undefined') {
 			// TODO - this is a hack: check if result is array - check all cases and make it more logical
-			if ((query.intofn || query.intoallfn) && Array.isArray(rs)) {
+			if ((query.intofn || query.intoallfn) && Array.isArray(rs) && !query.preserveArrayResult) {
 				rs = rs.length;
 			}
 			result = rs;
@@ -120,10 +123,19 @@ function queryfn3(query) {
 		if (query.aggrKeys.length > 0) {
 			var gfns = '';
 			query.aggrKeys.forEach(function (col) {
+				// For multi-column aggregates, pass undefined for each column parameter
+				var undefinedArgs = '';
+				if (col.args && col.args.length > 1) {
+					// Multi-column: pass undefined for each argument, then accumulator, then stage
+					undefinedArgs = Array(col.args.length).fill('undefined').join(',') + ',';
+				} else {
+					// Single column: pass undefined, accumulator, stage
+					undefinedArgs = 'undefined,';
+				}
 				gfns += `
 				g[${JSON.stringify(col.nick)}] = alasql.aggr[${JSON.stringify(
 					col.funcid
-				)}](undefined,g[${JSON.stringify(col.nick)}],3); `;
+				)}](${undefinedArgs}g[${JSON.stringify(col.nick)}],3); `;
 			});
 			var gfn = new Function('g,params,alasql', 'var y;' + gfns);
 		}
@@ -137,13 +149,25 @@ function queryfn3(query) {
 				var d = query.selectgfn(g, query.params, alasql);
 
 				for (const key in query.groupColumns) {
-					// ony remove columns where the alias is also not a column in the result
+					// only remove columns where the alias is also not a column in the result
+					// and no other alias in the result also points to the same nick
 					if (
 						query.groupColumns[key] !== key &&
 						d[query.groupColumns[key]] &&
 						!query.groupColumns[query.groupColumns[key]]
 					) {
-						delete d[query.groupColumns[key]];
+						// Check if any other key in the result also maps to this nick
+						var nick = query.groupColumns[key];
+						var otherAliasExists = false;
+						for (const otherKey in query.groupColumns) {
+							if (otherKey !== key && query.groupColumns[otherKey] === nick && d[otherKey]) {
+								otherAliasExists = true;
+								break;
+							}
+						}
+						if (!otherAliasExists) {
+							delete d[query.groupColumns[key]];
+						}
 					}
 				}
 				query.data.push(d);
@@ -153,15 +177,64 @@ function queryfn3(query) {
 	// Remove distinct values
 	doDistinct(query);
 
+	// If we have UNION/UNION ALL/EXCEPT/INTERSECT with ORDER BY/LIMIT before it,
+	// apply ORDER BY and LIMIT to the first SELECT before combining.
+	// This handles the pattern: SELECT ... ORDER BY ... LIMIT ... UNION ALL SELECT ... ORDER BY ... LIMIT ...
+	// We only do this if the UNION branch also has ORDER BY/LIMIT (pattern 2), not if ORDER BY is at the end (pattern 1).
+	var unionBranchHasOrder = ['unionallfn', 'unionfn', 'exceptfn', 'intersectfn'].some(
+		function (fnName) {
+			var fn = query[fnName];
+			return fn && fn.query && (fn.query.orderfn || fn.query.limit);
+		}
+	);
+
+	if (unionBranchHasOrder && (query.orderfn || query.limit)) {
+		// Apply ordering to first SELECT's data
+		if (query.orderfn) {
+			// Populate order keys before sorting (needed for UNION queries)
+			if (query.orderColumns) {
+				for (var i = 0, ilen = query.data.length; i < ilen; i++) {
+					for (var idx = 0; idx < query.orderColumns.length; idx++) {
+						var v = query.orderColumns[idx];
+						var key = '$$$' + idx;
+						var r = query.data[i];
+						if (v instanceof yy.Column && r[v.columnid] !== undefined) {
+							r[key] = r[v.columnid];
+						} else if (v instanceof yy.Column) {
+							r[key] = undefined;
+						} else {
+							r[key] = undefined;
+						}
+						if (i === 0 && query.removeKeys.indexOf(key) === -1) {
+							query.removeKeys.push(key);
+						}
+					}
+				}
+			}
+			query.data = query.data.sort(query.orderfn);
+			// Clear orderfn so it doesn't get applied again after UNION
+			query.orderfn = null;
+		}
+		// Apply limit to first SELECT's data
+		if (query.limit) {
+			doLimit(query);
+			// Clear limit so it doesn't get applied again after UNION
+			query.limit = null;
+			query.offset = null;
+		}
+	}
+
 	// UNION / UNION ALL
 	if (query.unionallfn) {
 		// TODO Simplify this part of program
 		var ud, nd;
 		if (query.corresponding) {
-			if (!query.unionallfn.query.modifier) query.unionallfn.query.modifier = undefined;
+			if (query.unionallfn.query && !query.unionallfn.query.modifier)
+				query.unionallfn.query.modifier = undefined;
 			ud = query.unionallfn(query.params);
 		} else {
-			if (!query.unionallfn.query.modifier) query.unionallfn.query.modifier = 'RECORDSET';
+			if (query.unionallfn.query && !query.unionallfn.query.modifier)
+				query.unionallfn.query.modifier = 'RECORDSET';
 			nd = query.unionallfn(query.params);
 			ud = [];
 			ilen = nd.data.length;
@@ -184,10 +257,12 @@ function queryfn3(query) {
 		query.data = query.data.concat(ud);
 	} else if (query.unionfn) {
 		if (query.corresponding) {
-			if (!query.unionfn.query.modifier) query.unionfn.query.modifier = 'ARRAY';
+			if (query.unionfn.query && !query.unionfn.query.modifier)
+				query.unionfn.query.modifier = 'ARRAY';
 			ud = query.unionfn(query.params);
 		} else {
-			if (!query.unionfn.query.modifier) query.unionfn.query.modifier = 'RECORDSET';
+			if (query.unionfn.query && !query.unionfn.query.modifier)
+				query.unionfn.query.modifier = 'RECORDSET';
 			nd = query.unionfn(query.params);
 			ud = [];
 			ilen = nd.data.length;
@@ -211,10 +286,12 @@ function queryfn3(query) {
 		query.data = arrayUnionDeep(query.data, ud);
 	} else if (query.exceptfn) {
 		if (query.corresponding) {
-			if (!query.exceptfn.query.modifier) query.exceptfn.query.modifier = 'ARRAY';
+			if (query.exceptfn.query && !query.exceptfn.query.modifier)
+				query.exceptfn.query.modifier = 'ARRAY';
 			var ud = query.exceptfn(query.params);
 		} else {
-			if (!query.exceptfn.query.modifier) query.exceptfn.query.modifier = 'RECORDSET';
+			if (query.exceptfn.query && !query.exceptfn.query.modifier)
+				query.exceptfn.query.modifier = 'RECORDSET';
 			var nd = query.exceptfn(query.params);
 			var ud = [];
 			for (var i = 0, ilen = nd.data.length; i < ilen; i++) {
@@ -229,10 +306,12 @@ function queryfn3(query) {
 		query.data = arrayExceptDeep(query.data, ud);
 	} else if (query.intersectfn) {
 		if (query.corresponding) {
-			if (!query.intersectfn.query.modifier) query.intersectfn.query.modifier = undefined;
+			if (query.intersectfn.query && !query.intersectfn.query.modifier)
+				query.intersectfn.query.modifier = undefined;
 			ud = query.intersectfn(query.params);
 		} else {
-			if (!query.intersectfn.query.modifier) query.intersectfn.query.modifier = 'RECORDSET';
+			if (query.intersectfn.query && !query.intersectfn.query.modifier)
+				query.intersectfn.query.modifier = 'RECORDSET';
 			nd = query.intersectfn(query.params);
 			ud = [];
 			ilen = nd.data.length;
@@ -247,6 +326,34 @@ function queryfn3(query) {
 		}
 
 		query.data = arrayIntersectDeep(query.data, ud);
+	}
+
+	// Populate order keys for UNION/INTERSECT/EXCEPT before ordering
+	if (
+		query.orderfn &&
+		query.orderColumns &&
+		(query.unionallfn || query.unionfn || query.exceptfn || query.intersectfn)
+	) {
+		for (i = 0, ilen = query.data.length; i < ilen; i++) {
+			for (var idx = 0; idx < query.orderColumns.length; idx++) {
+				var v = query.orderColumns[idx];
+				var key = '$$$' + idx;
+				var r = query.data[i];
+				if (v instanceof yy.Column && r[v.columnid] !== undefined) {
+					r[key] = r[v.columnid];
+				} else if (v instanceof yy.Column) {
+					// Column not found in row, set to null or undefined
+					r[key] = undefined;
+				} else {
+					// For expressions, we'd need to evaluate them, but for now just skip
+					r[key] = undefined;
+				}
+				// Add to removeKeys if not already there
+				if (i === 0 && query.removeKeys.indexOf(key) === -1) {
+					query.removeKeys.push(key);
+				}
+			}
+		}
 	}
 
 	// Ordering
@@ -376,7 +483,9 @@ function doDistinct(query) {
 		for (var i = 0, ilen = query.data.length; i < ilen; i++) {
 			var uix = keys
 				.map(function (k) {
-					return query.data[i][k];
+					var val = query.data[i][k];
+					// Properly serialize objects for comparison
+					return typeof val === 'object' ? JSON.stringify(val) : val;
 				})
 				.join('`');
 			uniq[uix] = query.data[i];
@@ -396,6 +505,8 @@ var preIndex = function (query) {
 	for (var k = 0, klen = query.sources.length; k < klen; k++) {
 		var source = query.sources[k];
 		delete source.ix;
+		// Declare variables at function scope for use across if/else branches
+		var scope, i, ilen, dataw, ixx, addr, group, res;
 		// If there is indexation rule
 		if (k > 0 && source.optimization == 'ix' && source.onleftfn && source.onrightfn) {
 			// If there is no table.indices - create it
@@ -403,7 +514,7 @@ var preIndex = function (query) {
 				if (!alasql.databases[source.databaseid].tables[source.tableid].indices)
 					query.database.tables[source.tableid].indices = {};
 				// Check if index already exists
-				let ixx =
+				ixx =
 					alasql.databases[source.databaseid].tables[source.tableid].indices[
 						hash(source.onrightfns + '`' + source.srcwherefns)
 					];
@@ -415,10 +526,9 @@ var preIndex = function (query) {
 			if (!source.ix) {
 				source.ix = {};
 				// Walking over source data
-				let scope = {};
-				let i = 0;
-				let ilen = source.data.length;
-				let dataw;
+				scope = {};
+				i = 0;
+				ilen = source.data.length;
 				//				while(source.getfn i<ilen) {
 
 				while (
@@ -515,7 +625,7 @@ var preIndex = function (query) {
 			// If there is no any optimization than apply srcwhere filter
 		} else if (source.srcwherefns && !source.dontcache) {
 			if (source.data) {
-				var scope = {};
+				scope = {};
 				// TODO!!!!! Data as Function
 
 				source.data = source.data.filter(function (r) {
@@ -526,7 +636,7 @@ var preIndex = function (query) {
 				scope = {};
 				i = 0;
 				ilen = source.data.length;
-				let res = [];
+				res = [];
 
 				while (
 					(dataw = source.data[i]) ||
